@@ -96,6 +96,26 @@ export default class TilingShellWindowManager extends GObject.Object {
                 );
             },
         );
+        // remember the size a window had before being maximized, so it can
+        // be restored when a window maximized with gaps is restored
+        this._signals.connect(
+            global.windowManager,
+            'size-change',
+            (
+                _,
+                actor: Meta.WindowActor,
+                whichChange: Meta.SizeChange,
+                oldFrameRect: Mtk.Rectangle | null
+            ) => {
+                if (whichChange !== Meta.SizeChange.MAXIMIZE || !oldFrameRect)
+                    return;
+                const window = actor.metaWindow as WindowWithCachedProps & {
+                    preMaximizeRect?: Mtk.Rectangle;
+                };
+                if (oldFrameRect.width > 0 && oldFrameRect.height > 0)
+                    window.preMaximizeRect = oldFrameRect.copy();
+            }
+        );
         this._signals.connect(
             global.windowManager,
             'size-changed',

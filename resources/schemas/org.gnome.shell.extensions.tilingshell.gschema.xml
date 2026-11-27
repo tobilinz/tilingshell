@@ -132,6 +132,11 @@
             <summary>Drag agains top edge to maximize window</summary>
             <description>Drag windows against the top edge to maximize them</description>
         </key>
+        <key name="maximize-with-gaps" type="b">
+            <default>false</default>
+            <summary>Apply outer gaps to maximized and new windows</summary>
+            <description>Maximized windows keep the outer gaps. New windows that open larger than the screen, or that resize themselves right after being tiled, are fitted inside the gaps.</description>
+        </key>
         <key name="override-window-menu" type="b">
             <default>true</default>
             <summary>Add snap assistant and auto-tile buttons to window menu</summary>
