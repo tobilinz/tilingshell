@@ -36,6 +36,46 @@ import {
 } from '../../utils/gnomesupport';
 
 const MINIMUM_DISTANCE_TO_RESTORE_ORIGINAL_SIZE = 90;
+// how long after a window is opened Tiling Shell keeps checking that the
+// application did not resize the window by itself (e.g. Firefox/Zen restoring
+// their session size after the window was already mapped)
+const NEW_WINDOW_WATCH_MS = 5000;
+// upper bound to the number of corrections for a new window, so we never
+// fight forever with an application that refuses the given size
+const MAX_NEW_WINDOW_CORRECTIONS = 8;
+// tolerance, in pixels, when comparing a window's size with the expected one
+const RECT_TOLERANCE = 2;
+const FULL_TILE = () =>
+    new Tile({ x: 0, y: 0, width: 1, height: 1, groups: [] });
+
+function isFullTile(tile: Tile | undefined): boolean {
+    if (!tile) return false;
+    const eps = 0.001;
+    return (
+        Math.abs(tile.x) < eps &&
+        Math.abs(tile.y) < eps &&
+        Math.abs(tile.width - 1) < eps &&
+        Math.abs(tile.height - 1) < eps
+    );
+}
+
+function rectsAlmostEqual(a: Mtk.Rectangle, b: Mtk.Rectangle): boolean {
+    return (
+        Math.abs(a.x - b.x) <= RECT_TOLERANCE &&
+        Math.abs(a.y - b.y) <= RECT_TOLERANCE &&
+        Math.abs(a.width - b.width) <= RECT_TOLERANCE &&
+        Math.abs(a.height - b.height) <= RECT_TOLERANCE
+    );
+}
+
+function rectContains(outer: Mtk.Rectangle, inner: Mtk.Rectangle): boolean {
+    return (
+        inner.x >= outer.x &&
+        inner.y >= outer.y &&
+        inner.x + inner.width <= outer.x + outer.width &&
+        inner.y + inner.height <= outer.y + outer.height
+    );
+}
 
 class SnapAssistingInfo {
     private _snapAssistantLayoutId: string | undefined;
@@ -81,6 +121,7 @@ export class TilingManager {
     private _snapAssistingInfo: SnapAssistingInfo;
 
     private _movingWindowTimerId: number | null = null;
+    private _newWindowWatchers: Set<() => void> = new Set();
 
     private readonly _signals: SignalHandling;
     private readonly _debug: (..._content: unknown[]) => void;
@@ -301,15 +342,21 @@ export class TilingManager {
             global.display,
             'window-created',
             (_display: Meta.Display, window: Meta.Window) => {
+                (window as ExtendedWindow).openedAt = GLib.get_monotonic_time();
                 if (Settings.ENABLE_AUTO_TILING) this._autoTile(window, true);
-            },
+                if (Settings.MAXIMIZE_WITH_GAPS) this._watchNewWindow(window);
+            }
         );
         this._signals.connect(
             TilingShellWindowManager.get(),
             'unmaximized',
             (_, window: Meta.Window) => {
+                // if the window was unmaximized because Tiling Shell tiled it
+                // (e.g. when applying gaps to a maximized window), it already
+                // has a tile and it must not be auto tiled somewhere else
+                if ((window as ExtendedWindow).assignedTile) return;
                 if (Settings.ENABLE_AUTO_TILING) this._autoTile(window, false);
-            },
+            }
         );
 
         // forget assigned tile when window is maximized
@@ -317,9 +364,35 @@ export class TilingManager {
             TilingShellWindowManager.get(),
             'maximized',
             (_, window: Meta.Window) => {
-                delete (window as ExtendedWindow).assignedTile;
-            },
+                const extWin = window as ExtendedWindow;
+                const wasFullTiled = isFullTile(extWin.assignedTile);
+                delete extWin.assignedTile;
+
+                if (!Settings.MAXIMIZE_WITH_GAPS) return;
+                if (window.get_monitor() !== this._monitor.index) return;
+
+                // let mutter complete the maximization before changing it
+                this._deferForWindow(window, () => {
+                    // a window that already fills the whole area inside the
+                    // gaps was maximized again (e.g. by double-clicking its
+                    // title bar): behave like a toggle and restore its size.
+                    // Windows that just opened are excluded, since some apps
+                    // (e.g. Firefox/Zen) maximize themselves during startup.
+                    if (wasFullTiled && !this._isNewWindow(window))
+                        this._restoreFromMaximizedWithGaps(window);
+                    else this._maximizeWithGaps(window, false);
+                });
+            }
         );
+
+        this._signals.connect(Settings, Settings.KEY_MAXIMIZE_WITH_GAPS, () => {
+            if (!Settings.MAXIMIZE_WITH_GAPS) return;
+            // apply gaps to the windows that are already maximized
+            getWindows().forEach(win => {
+                if (win && win.get_monitor() === this._monitor.index)
+                    this._maximizeWithGaps(win, false);
+            });
+        });
     }
 
     public onUntileWindow(window: Meta.Window, force: boolean): void {
@@ -474,6 +547,8 @@ export class TilingManager {
             this._movingWindowTimerId = null;
         }
         this._signals.disconnect();
+        [...this._newWindowWatchers].forEach((stop) => stop());
+        this._newWindowWatchers.clear();
         this._isGrabbingWindow = false;
         this._removeRmbFilterIfInstalled();
         this._snapAssistingInfo.update(undefined);
@@ -1246,14 +1321,19 @@ export class TilingManager {
         this.openSelectionTilePreview(edgeTile, false, true, window);
     }
 
-    private _easeWindowRectFromTile(
+    /**
+     * Computes where a window would be placed if tiled to the given tile,
+     * taking the inner and outer gaps into account.
+     */
+    private _computeTileRect(
         tile: Tile,
-        window: Meta.Window,
-        skipAnimation: boolean = false,
-    ) {
+        window: Meta.Window
+    ):
+        | { scaledRect: Mtk.Rectangle; destinationRect: Mtk.Rectangle }
+        | undefined {
         const currentWs = window.get_workspace();
         const tilingLayout = this._workspaceTilingLayout.get(currentWs);
-        if (!tilingLayout) return;
+        if (!tilingLayout) return undefined;
 
         // We apply the proportions to get tile size and position relative to the work area
         const scaledRect = TileUtils.apply_props(tile, this._workArea);
@@ -1287,7 +1367,7 @@ export class TilingManager {
             this._workArea,
             this._enableScaling
                 ? getScalingFactorOf(tilingLayout)[1]
-                : undefined,
+                : undefined
         ).gaps;
 
         const destinationRect = buildRectangle({
@@ -1296,6 +1376,18 @@ export class TilingManager {
             width: scaledRect.width - gaps.left - gaps.right,
             height: scaledRect.height - gaps.top - gaps.bottom,
         });
+
+        return { scaledRect, destinationRect };
+    }
+
+    private _easeWindowRectFromTile(
+        tile: Tile,
+        window: Meta.Window,
+        skipAnimation: boolean = false
+    ) {
+        const computed = this._computeTileRect(tile, window);
+        if (!computed) return;
+        const { scaledRect, destinationRect } = computed;
 
         // abort if there is an invalid selection
         if (destinationRect.width <= 0 || destinationRect.height <= 0) return;
@@ -1347,6 +1439,289 @@ export class TilingManager {
             }),
             window,
         );
+    }
+
+    /**
+     * Runs the callback once the main loop is idle, if the window still exists.
+     */
+    private _deferForWindow(window: Meta.Window, callback: () => void) {
+        let sourceId = 0;
+        const cancel = () => {
+            if (sourceId) GLib.Source.remove(sourceId);
+            sourceId = 0;
+            this._newWindowWatchers.delete(cancel);
+        };
+        sourceId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            sourceId = 0;
+            this._newWindowWatchers.delete(cancel);
+            if (window.get_compositor_private()) callback();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._newWindowWatchers.add(cancel);
+    }
+
+    private _isNewWindow(window: Meta.Window): boolean {
+        const openedAt = (window as ExtendedWindow).openedAt;
+        if (openedAt === undefined) return false;
+        return (
+            GLib.get_monotonic_time() - openedAt < NEW_WINDOW_WATCH_MS * 1000
+        );
+    }
+
+    private _canApplyGaps(window: Meta.Window): boolean {
+        return (
+            window !== null &&
+            window.get_monitor() === this._monitor.index &&
+            window.windowType === Meta.WindowType.NORMAL &&
+            window.get_transient_for() === null &&
+            !window.is_attached_dialog() &&
+            !window.minimized &&
+            !window.is_fullscreen() &&
+            // mutter reports maximized windows as not resizable
+            (window.maximizedHorizontally || window.maximizedVertically
+                ? window.can_maximize()
+                : window.allows_resize())
+        );
+    }
+
+    private _defaultFloatingRect(): Mtk.Rectangle {
+        const width = Math.round(this._workArea.width * 0.66);
+        const height = Math.round(this._workArea.height * 0.75);
+        return buildRectangle({
+            x:
+                this._workArea.x +
+                Math.round((this._workArea.width - width) / 2),
+            y:
+                this._workArea.y +
+                Math.round((this._workArea.height - height) / 2),
+            width,
+            height,
+        });
+    }
+
+    /**
+     * Replaces the maximized state of a window with a tile that spans the
+     * whole work area minus the outer gaps.
+     * @returns true if the window was changed
+     */
+    private _maximizeWithGaps(
+        window: Meta.Window,
+        skipAnimation: boolean
+    ): boolean {
+        if (!Settings.MAXIMIZE_WITH_GAPS) return false;
+        if (!this._canApplyGaps(window)) return false;
+        if (!window.maximizedHorizontally || !window.maximizedVertically)
+            return false;
+
+        const computed = this._computeTileRect(FULL_TILE(), window);
+        if (!computed) return false;
+        const { destinationRect } = computed;
+        if (destinationRect.width <= 0 || destinationRect.height <= 0)
+            return false;
+        // without outer gaps a maximized window is already what we want
+        if (rectsAlmostEqual(destinationRect, this._workArea)) return false;
+
+        const extWin = window as ExtendedWindow;
+        // remember the size to restore when the window is "unmaximized".
+        // If the window was tiled before, keep the size it had before that.
+        if (!extWin.originalSize) {
+            const pre = extWin.preMaximizeRect;
+            const preIsValid =
+                pre !== undefined &&
+                pre.width <= destinationRect.width &&
+                pre.height <= destinationRect.height;
+            extWin.originalSize = preIsValid
+                ? pre.copy()
+                : this._defaultFloatingRect();
+        }
+        extWin.assignedTile = undefined;
+        this._easeWindowRectFromTile(FULL_TILE(), window, skipAnimation);
+        return true;
+    }
+
+    /**
+     * Restores the size a window had before it was maximized with gaps.
+     */
+    private _restoreFromMaximizedWithGaps(window: Meta.Window) {
+        if (!this._canApplyGaps(window)) return;
+
+        const extWin = window as ExtendedWindow;
+        const size = extWin.originalSize ?? this._defaultFloatingRect();
+        const width = Math.min(size.width, this._workArea.width);
+        const height = Math.min(size.height, this._workArea.height);
+        const destination = buildRectangle({
+            x: Math.min(
+                Math.max(size.x, this._workArea.x),
+                this._workArea.x + this._workArea.width - width
+            ),
+            y: Math.min(
+                Math.max(size.y, this._workArea.y),
+                this._workArea.y + this._workArea.height - height
+            ),
+            width,
+            height,
+        });
+        extWin.assignedTile = undefined;
+        extWin.originalSize = undefined;
+        if (window.maximizedHorizontally || window.maximizedVertically)
+            unmaximizeWindow(window);
+        this._easeWindowRect(window, destination, false, true);
+    }
+
+    /**
+     * Makes sure a newly opened window respects the gaps. It is called when the
+     * window shows up and every time it changes size in the first seconds.
+     * @returns true if the window was changed
+     */
+    private _fitNewWindow(window: Meta.Window): boolean {
+        if (!Settings.MAXIMIZE_WITH_GAPS) return false;
+        if (!this._canApplyGaps(window)) return false;
+
+        // e.g. Ghostty with "maximize = true", or Zen restoring a maximized session
+        if (window.maximizedHorizontally && window.maximizedVertically)
+            return this._maximizeWithGaps(window, true);
+        // half-maximized windows (GNOME's own edge tiling) are left alone
+        if (window.maximizedHorizontally || window.maximizedVertically)
+            return false;
+
+        const extWin = window as ExtendedWindow;
+        const frame = window.get_frame_rect();
+
+        // the window was tiled (e.g. by auto tiling) but the application
+        // resized itself afterwards: tile it again
+        if (extWin.assignedTile) {
+            const computed = this._computeTileRect(extWin.assignedTile, window);
+            if (!computed || rectsAlmostEqual(frame, computed.destinationRect))
+                return false;
+            this._easeWindowRectFromTile(extWin.assignedTile, window, true);
+            return true;
+        }
+
+        // the window opened larger than the area inside the gaps, or partially
+        // outside of the screen: fit it inside the gaps
+        const computed = this._computeTileRect(FULL_TILE(), window);
+        if (!computed) return false;
+        const area = computed.destinationRect;
+        if (area.width <= 0 || area.height <= 0) return false;
+        if (
+            frame.width <= area.width &&
+            frame.height <= area.height &&
+            rectContains(this._workArea, frame)
+        )
+            return false;
+
+        const width = Math.min(frame.width, area.width);
+        const height = Math.min(frame.height, area.height);
+        if (
+            Math.abs(width - area.width) <= RECT_TOLERANCE &&
+            Math.abs(height - area.height) <= RECT_TOLERANCE
+        ) {
+            // it fills the whole area: treat it as tiled, so that dragging it
+            // away restores a sensible size
+            this._easeWindowRectFromTile(FULL_TILE(), window, true);
+            extWin.originalSize = this._defaultFloatingRect();
+            return true;
+        }
+
+        const x = Math.min(
+            Math.max(frame.x, area.x),
+            area.x + area.width - width
+        );
+        const y = Math.min(
+            Math.max(frame.y, area.y),
+            area.y + area.height - height
+        );
+        if (
+            x === frame.x &&
+            y === frame.y &&
+            width === frame.width &&
+            height === frame.height
+        )
+            return false;
+        window.move_resize_frame(false, x, y, width, height);
+        return true;
+    }
+
+    /**
+     * Watches a newly created window for a few seconds. Some applications
+     * (e.g. Firefox and Firefox based browsers like Zen) map their window and
+     * only later restore the size saved in their session, overriding the
+     * position and size given by Tiling Shell.
+     */
+    private _watchNewWindow(window: Meta.Window) {
+        let corrections = 0;
+        let shownId = 0;
+        let sizeChangedId = 0;
+        let unmanagedId = 0;
+        let grabId = 0;
+        let timeoutId = 0;
+        let idleId = 0;
+
+        const stop = () => {
+            if (shownId) window.disconnect(shownId);
+            if (sizeChangedId) window.disconnect(sizeChangedId);
+            if (unmanagedId) window.disconnect(unmanagedId);
+            if (grabId) global.display.disconnect(grabId);
+            if (timeoutId) GLib.Source.remove(timeoutId);
+            if (idleId) GLib.Source.remove(idleId);
+            shownId = 0;
+            sizeChangedId = 0;
+            unmanagedId = 0;
+            grabId = 0;
+            timeoutId = 0;
+            idleId = 0;
+            this._newWindowWatchers.delete(stop);
+        };
+
+        const check = () => {
+            // coalesce multiple changes into a single check, and let other
+            // handlers (e.g. auto tiling) run first
+            if (idleId) return;
+            idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                idleId = 0;
+                if (!Settings.MAXIMIZE_WITH_GAPS) {
+                    stop();
+                    return GLib.SOURCE_REMOVE;
+                }
+                if (this._fitNewWindow(window)) corrections++;
+                if (corrections >= MAX_NEW_WINDOW_CORRECTIONS) stop();
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+
+        // (re)start the countdown after which the window is no longer watched
+        const restartTimeout = () => {
+            if (timeoutId) GLib.Source.remove(timeoutId);
+            timeoutId = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                NEW_WINDOW_WATCH_MS,
+                () => {
+                    timeoutId = 0;
+                    stop();
+                    return GLib.SOURCE_REMOVE;
+                }
+            );
+        };
+
+        shownId = window.connect('shown', () => {
+            window.disconnect(shownId);
+            shownId = 0;
+            // the watch period starts when the window is actually shown
+            (window as ExtendedWindow).openedAt = GLib.get_monotonic_time();
+            restartTimeout();
+            check();
+        });
+        sizeChangedId = window.connect('size-changed', () => check());
+        unmanagedId = window.connect('unmanaged', () => stop());
+        // the user is moving or resizing the window: stop interfering
+        grabId = global.display.connect(
+            'grab-op-begin',
+            (_display: Meta.Display, grabbed: Meta.Window) => {
+                if (grabbed === window) stop();
+            }
+        );
+        restartTimeout();
+        this._newWindowWatchers.add(stop);
     }
 
     private _autoTile(window: Meta.Window, windowCreated: boolean) {

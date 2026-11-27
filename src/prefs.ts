@@ -98,6 +98,15 @@ export default class TilingShellExtensionPreferences extends ExtensionPreference
         );
         appearenceGroup.add(outerGapsRow);
 
+        const maximizeWithGapsRow = this._buildSwitchRow(
+            Settings.KEY_MAXIMIZE_WITH_GAPS,
+            _('Apply outer gaps to maximized and new windows'),
+            _(
+                'Maximized windows keep the outer gaps, and new windows that open too large are fitted inside them'
+            )
+        );
+        appearenceGroup.add(maximizeWithGapsRow);
+
         const blurRow = new Adw.ExpanderRow({
             title: _('Blur (experimental feature)'),
             subtitle: _(

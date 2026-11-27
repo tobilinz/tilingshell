@@ -108,6 +108,7 @@ export default class Settings {
         'raise-together-current-monitor-only';
     static KEY_ACTIVE_SCREEN_EDGES = 'active-screen-edges';
     static KEY_TOP_EDGE_MAXIMIZE = 'top-edge-maximize';
+    static KEY_MAXIMIZE_WITH_GAPS = 'maximize-with-gaps';
     static KEY_OVERRIDE_WINDOW_MENU = 'override-window-menu';
     static KEY_OVERRIDE_ALT_TAB = 'override-alt-tab';
     static KEY_SNAP_ASSISTANT_THRESHOLD = 'snap-assistant-threshold';
@@ -368,6 +369,14 @@ export default class Settings {
 
     static set ACTIVE_SCREEN_EDGES(val: boolean) {
         set_boolean(Settings.KEY_ACTIVE_SCREEN_EDGES, val);
+    }
+
+    static get MAXIMIZE_WITH_GAPS(): boolean {
+        return get_boolean(Settings.KEY_MAXIMIZE_WITH_GAPS);
+    }
+
+    static set MAXIMIZE_WITH_GAPS(val: boolean) {
+        set_boolean(Settings.KEY_MAXIMIZE_WITH_GAPS, val);
     }
 
     static get TOP_EDGE_MAXIMIZE(): boolean {
